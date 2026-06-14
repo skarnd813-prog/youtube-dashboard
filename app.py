@@ -3,10 +3,11 @@ import pandas as pd
 from collections import Counter
 import re
 import os
-import time
+import datetime
 from googleapiclient.discovery import build
+import google.generativeai as genai
 
-# API 키 구조 유지 (st.secrets)
+# [요구사항 8] API 키 로드 및 검증 구조 유지
 try:
     YOUTUBE_API_KEY = st.secrets["YOUTUBE_API_KEY"]
     GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
@@ -18,7 +19,7 @@ st.set_page_config(page_title="YouTube Marketing Dashboard", layout="wide")
 st.title("📊 YouTube Marketing Dashboard")
 
 # -----------------------------------------------------------------------------
-# 제목 키워드 분석 함수
+# 보조 분석용 단순 텍스트 토큰화 함수
 # -----------------------------------------------------------------------------
 def get_top_keywords(titles):
     words = []
@@ -29,63 +30,139 @@ def get_top_keywords(titles):
     return ", ".join([f"'{k}'({c}회)" for k, c in most_common])
 
 # -----------------------------------------------------------------------------
-# 실제 YouTube API 호출 및 검증 함수
+# [요구사항 1, 2, 8] 실제 YouTube API 데이터 수집 및 엄격한 검증 함수
 # -----------------------------------------------------------------------------
 @st.cache_data(show_spinner=False)
-def fetch_real_youtube_data(query, max_videos):
+def fetch_real_youtube_data_v2(query, max_videos):
     if not YOUTUBE_API_KEY:
         return "API_KEY_MISSING", None
 
     try:
         youtube = build("youtube", "v3", developerKey=YOUTUBE_API_KEY)
         
+        # 1. search().list 호출하여 뼈대 데이터 수집
         search_response = youtube.search().list(
             q=query,
-            part="id",
+            part="id,snippet",
             type="video",
             maxResults=max_videos
         ).execute()
         
-        video_ids = [item["id"]["videoId"] for item in search_response.get("items", []) if "videoId" in item.get("id", {})]
-        
+        items = search_response.get("items", [])
+        if not items:
+            return "NO_RESULTS", None
+            
+        # [요구사항 1-1, 8-1] videoId 추출 및 엄격한 누락 검증
+        video_ids = []
+        video_snippets = {}
+        for item in items:
+            v_id = item.get("id", {}).get("videoId")
+            if v_id:
+                video_ids.append(v_id)
+                video_snippets[v_id] = item.get("snippet", {})
+            else:
+                # [요구사항 1-7, 8-2] videoId가 없는 결과는 원천 제외 및 에러 처리 분기 목적
+                return "VIDEO_ID_MISSING_ERROR", None
+                
         if not video_ids:
             return "NO_RESULTS", None
             
+        # 2. videos().list 호출하여 실제 마케팅 수치(statistics) 가져오기
         videos_response = youtube.videos().list(
             id=",".join(video_ids),
-            part="snippet,statistics"
+            part="snippet,statistics,contentDetails"
         ).execute()
         
         real_data = []
+        current_date = datetime.date.today()
+        
         for idx, item in enumerate(videos_response.get("items", []), start=1):
+            v_id = item.get("id", "")
             snippet = item.get("snippet", {})
             statistics = item.get("statistics", {})
-            v_id = item.get("id", "")
+            content_details = item.get("contentDetails", {})
             
-            if not v_id:
-                continue
+            # [요구사항 1-2, 7] 영상 URL 규칙 적용
             video_url = f"https://www.youtube.com/watch?v={v_id}"
+            
+            # 일평균 조회수 계산용 경과일 연산
+            pub_date_str = snippet.get("publishedAt", "")[:10]
+            try:
+                pub_date = datetime.datetime.strptime(pub_date_str, "%Y-%m-%d").date()
+                days_elapsed = (current_date - pub_date).days
+                if days_elapsed <= 0:
+                    days_elapsed = 1
+            except:
+                days_elapsed = 1
+                
+            # 쇼츠 판단 (재생시간 기반 포맷 식별 보조)
+            duration = content_details.get("duration", "")
+            is_shorts = "쇼츠" if "M" not in duration and "H" not in duration else "일반 영상"
+            
+            # 데이터 매핑 (좋아요 수 누락 예외방어 포함)
+            views = int(statistics.get("viewCount", 0))
+            likes = statistics.get("likeCount")
+            likes_val = int(likes) if likes is not None else "확인 불가"
+            comments = int(statistics.get("commentCount", 0))
             
             real_data.append({
                 "순위": idx,
                 "영상 제목": snippet.get("title", ""),
                 "채널명": snippet.get("channelTitle", ""),
-                "조회수": int(statistics.get("viewCount", 0)),
-                "좋아요": int(statistics.get("likeCount", 0)),
-                "댓글": int(statistics.get("commentCount", 0)),
-                "업로드일": snippet.get("publishedAt", "")[:10],
-                "영상 보기": video_url
+                "조회수": views,
+                "좋아요": likes_val,
+                "댓글": comments,
+                "업로드일": pub_date_str,
+                "videoId": v_id,
+                "영상 URL": video_url,
+                "영상 보기": video_url, # [요구사항 7] 링크 전용 복제 컬럼
+                "경과일": days_elapsed,
+                "포맷": is_shorts
             })
             
         df = pd.DataFrame(real_data)
-        
-        if df.empty or "영상 보기" not in df.columns:
-            return "VALIDATION_FAILED", None
-            
         return "SUCCESS", df
 
     except Exception:
         return "API_CALL_FAILED", None
+
+# -----------------------------------------------------------------------------
+# [요구사항 5] 표준/정밀 분석 전용 Gemini 마케터 관점 가공 함수
+# -----------------------------------------------------------------------------
+def get_gemini_marketing_insight(df, query, mode):
+    if not GEMINI_API_KEY:
+        return "Gemini API 키가 Secrets에 설정되어 있지 않아 분석 리포트 출력을 건너뜁니다."
+    
+    try:
+        genai.configure(api_key=GEMINI_API_KEY)
+        model = genai.GenerativeModel("gemini-1.5-flash")
+        
+        # [요구사항 5-1] 오직 수집된 원본 메타데이터 요약본만 원천 근거로 전송
+        raw_context = ""
+        for idx, row in df.iterrows():
+            raw_context += f"제목: {row['영상 제목']}, 채널: {row['채널명']}, 조회수: {row['조회수']}, 좋아요: {row['좋아요']}, 댓글: {row['댓글']}, 포맷: {row['포맷']}, URL: {row['영상 URL']}\n"
+            
+        prompt = f"""
+        당신은 대한민국 최고의 뷰티/제품 마케팅 전략가입니다.
+        아래 제공된 데이터는 유튜브에서 실시간으로 수집한 '{query}' 키워드의 실제 영상 데이터셋입니다.
+        반드시 제공된 실제 데이터의 영상 제목, 채널명, 수치적 성과만을 100% 근거로 삼아 마케터가 바로 카피라이팅 및 콘텐츠 기획에 참고할 수 있는 리포트를 작성하세요.
+        존재하지 않는 가짜 영상 제목이나 허구의 통계치를 지어내는 것은 절대 엄금합니다.
+
+        [분석 대상 데이터]
+        {raw_context}
+
+        아래 5가지 요구항목에 대해 마케터가 실무 보고서에 바로 복사하여 사용할 수 있도록 구체적인 문장과 마크다운 형식을 사용하여 한글로 작성하세요.
+
+        1. 조회수 높은 영상들의 공통 후킹 포인트 (제목 표현 방식, 콘텐츠 소재, 가격/성분/추천/비교/후기 중 어떤 요소가 소비자를 자극했는지 파악)
+        2. 댓글이 많은 영상들의 대화 유발 요소 (조회수 대비 시청자가 댓글 탭을 열고 반응을 남기게 만든 트리거 행동이나 의문점 분석)
+        3. 마케터가 참고할 콘텐츠 포맷 (A/B/C 유형으로 구체적인 기획 방향 3개 네이밍 및 실행 전략 제안)
+        4. 브랜드가 활용할 수 있는 핵심 메시지 방향 (소비자 인식을 전환시킬 마케팅 메시지 제안)
+        5. 이 키워드 영역에서 피해야 할 유저가 피로감을 느끼는 뻔한 콘텐츠 방향
+        """
+        response = model.generate_content(prompt)
+        return response.text
+    except Exception as e:
+        return f"Gemini 분석 연산 중 오류가 발생했습니다: {str(e)}"
 
 # -----------------------------------------------------------------------------
 # 사이드바 설정 영역
@@ -114,113 +191,17 @@ analyze_captions = st.sidebar.checkbox("자막 분석 포함 (Gemini 연동)", v
 include_shorts = st.sidebar.checkbox("쇼츠 포함", value=True)
 
 # -----------------------------------------------------------------------------
-# 본문 실행 영역
+# 본문 검색 영역
 # -----------------------------------------------------------------------------
 st.subheader("🔍 유튜브 검색 및 분석")
 query = st.text_input("분석할 유튜브 링크나 키워드를 입력하세요:")
 
 if analysis_mode == "빠른 분석":
-    st.info("💡 빠른 분석은 Gemini 상세 분석 없이 YouTube 메타데이터 기반으로 결과를 제공합니다.")
+    st.info("💡 빠른 분석은 Gemini 상세 분석 없이 YouTube 메타데이터 기반으로 통계적 마케팅 시사점을 제공합니다.")
 
 if query:
     status_text = st.empty()
-    status_text.markdown("🔄 **현재 단계:** `실시간 YouTube API 호출 및 데이터 수집 중`...")
+    status_text.markdown("🔄 **현재 단계:** `유튜브 실시간 데이터 수집 및 무결성 검증 중`...")
     
-    result_code, df = fetch_real_youtube_data(query, max_videos)
-    
-    if result_code == "API_KEY_MISSING":
-        status_text.empty()
-        st.error("Secrets에 YOUTUBE_API_KEY가 설정되지 않았습니다.")
-        
-    elif result_code == "API_CALL_FAILED":
-        status_text.empty()
-        st.error("YouTube API 호출에 실패했습니다. API 키, 할당량, API 활성화 상태를 확인해주세요.")
-        
-    elif result_code == "NO_RESULTS":
-        status_text.empty()
-        st.warning("검색 결과가 없습니다. 키워드 또는 필터 조건을 변경해주세요.")
-        
-    elif result_code == "VALIDATION_FAILED":
-        status_text.empty()
-        st.error("오류: 수집된 데이터에 유효한 Video ID 또는 영상 URL이 포함되어 있지 않습니다.")
-        
-    elif result_code == "SUCCESS" and df is not None:
-        status_text.success("✅ **분석 완료!**")
-        st.write("---")
-        
-        # A. 핵심 요약 섹션
-        st.subheader("📌 A. 핵심 요약")
-        avg_views = int(df["조회수"].mean())
-        max_view_row = df.loc[df["조회수"].idxmax()]
-        avg_likes = int(df["좋아요"].mean())
-        avg_comments = int(df["댓글"].mean())
-        
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric(label="분석된 영상 수", value=f"{len(df)} 개")
-            st.metric(label="평균 조회수", value=f"{avg_views:,} 회")
-        with col2:
-            st.metric(label="평균 좋아요 수", value=f"{avg_likes:,} 개")
-            st.metric(label="평균 댓글 수", value=f"{avg_comments:,} 개")
-        with col3:
-            st.metric(label="최신 업로드일", value=df["업로드일"].max())
-            st.metric(label="쇼츠 포함 여부", value="포함" if include_shorts else "제외")
-            
-        st.info(f"🏆 **최고 인기 영상:** {max_view_row['영상 제목']} ({max_view_row['조회수']:,}회)")
-        st.write("---")
-        
-        # B. 인기 영상 TOP 3 섹션
-        st.subheader("🔥 B. 인기 영상 TOP 3")
-        top_views = df.nlargest(3, "조회수")
-        top_comments = df.nlargest(3, "댓글")
-        top_recent = df.sort_values(by="업로드일", ascending=False).head(3)
-        
-        col_v, col_c, col_r = st.columns(3)
-        with col_v:
-            st.markdown("📈 **조회수 높은 영상**")
-            for idx, row in top_views.iterrows():
-                st.write(f"- {row['영상 제목']} ({row['조회수']:,}회)")
-        with col_c:
-            st.markdown("💬 **댓글이 많은 영상**")
-            for idx, row in top_comments.iterrows():
-                st.write(f"- {row['영상 제목']} ({row['댓글']:,}개)")
-        with col_r:
-            st.markdown("📅 **최근 업로드 영상**")
-            for idx, row in top_recent.iterrows():
-                st.write(f"- {row['영상 제목']} ({row['업로드일']})")
-        st.write("---")
-        
-        # C. 마케팅 시사점 섹션
-        st.subheader("💡 C. 마케팅 시사점")
-        keyword_result = get_top_keywords(df["영상 제목"].tolist())
-        st.success(f"📌 **제목 내 자주 등장하는 키워드 TOP 5:** {keyword_result}")
-        
-        if analysis_mode in ["표준 분석", "정밀 분석"]:
-            if not GEMINI_API_KEY:
-                st.warning("GEMINI_API_KEY가 없어 AI 시사점 생성을 건너뜁니다.")
-            else:
-                st.markdown("🤖 **Gemini AI 통합 마케팅 인사이트 보고서**")
-                if analysis_mode == "표준 분석":
-                    st.write(f"본 리포트는 실시간 수집된 {len(df)}개 영상 데이터를 종합 요약한 결과입니다.")
-                elif analysis_mode == "정밀 분석":
-                    st.write(f"**실시간 데이터 융합 분석 결과:** 수집된 메타데이터 통계 기반으로 타겟 분석을 제공합니다.")
-        st.write("---")
-        
-        # D. 이번 분석 대상 영상 섹션
-        st.subheader("📺 D. 이번 분석 대상 영상")
-        st.markdown("아래 목록은 입력한 키워드와 옵션에 따라 유튜브에서 수집한 영상입니다.")
-        
-        target_columns = ["순위", "영상 제목", "채널명", "조회수", "좋아요", "댓글", "업로드일", "영상 보기"]
-        
-        st.dataframe(
-            df[target_columns],
-            column_config={
-                "영상 보기": st.column_config.LinkColumn(
-                    "영상 보기",
-                    help="클릭하면 해당 유튜브 영상으로 바로 이동합니다",
-                    display_text="영상 보기"
-                )
-            },
-            use_container_width=True,
-            hide_index=True
-        )
+    # 데이터 수집 호출
+    result_code, df = fetch_real_youtube_data_v2(query, max_videos
